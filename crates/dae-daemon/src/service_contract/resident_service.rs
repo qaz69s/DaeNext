@@ -777,16 +777,20 @@ fn install_core_event_log_sink(options: &ResidentRunOptions, config: &Config) {
         // 没给 --logfile 时不装（stdout/stderr 由 procd 收进 logd）
         return;
     };
-    let configured_level = config.global.log_level.clone();
+    // 阈值来源：Dove 包通过 DOVE_EVENT_LOG_LEVEL 透传（UCI dove.settings.log_level，默认 info）。
+    // 不用 config.global.log_level —— DaeNext 里它的默认值是 "error"（给产品层用），
+    // core 直接吃它会几乎什么都记不到。
+    let _ = config;
+    let configured_level = std::env::var("DOVE_EVENT_LOG_LEVEL")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "info".to_owned());
 
     let level_for_policy = configured_level.clone();
     dae_resident_dataplane::facade::set_event_log_policies(
         Some(Arc::new(move |event: &serde_json::Value| {
-            let name = event
-                .get("event")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let level = resident_core_event_level(name);
+            let level = resident_core_event_level_of(event);
             dae_resident_dataplane::facade::ResidentEventLogDecision {
                 persist: resident_core_log_level_enabled(&level_for_policy, level),
                 level: Some(level.to_owned()),
@@ -797,6 +801,9 @@ fn install_core_event_log_sink(options: &ResidentRunOptions, config: &Config) {
         None,
     );
 
+    // 输出样式：logfmt（默认，LuCI 日志页能解析并上色/分级过滤）或 json（原始事件）
+    // 由 init 从 UCI 透传：DOVE_EVENT_LOG_STYLE=logfmt|json
+    let style = std::env::var("DOVE_EVENT_LOG_STYLE").unwrap_or_else(|_| "logfmt".to_owned());
     let sink_state: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
     dae_resident_dataplane::facade::set_event_log_sink(Some(Arc::new(
         move |event: &serde_json::Value| {
@@ -811,13 +818,200 @@ fn install_core_event_log_sink(options: &ResidentRunOptions, config: &Config) {
                     .ok();
             }
             if let Some(file) = guard.as_mut() {
-                let _ = writeln!(file, "{event}");
+                let name = event
+                    .get("event")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                // 事件模块是 dispatch-only：persist 只是给 sink 的提示，
+                // 真正的过滤必须在这里做（否则 log_level 形同虚设）
+                let level = resident_core_event_level_of(event);
+                if !resident_core_log_level_enabled(&configured_level, level) {
+                    return;
+                }
+                if style == "json" {
+                    let _ = writeln!(file, "{event}");
+                } else {
+                    let _ = writeln!(file, "{}", render_core_event_logfmt(event, name, level));
+                }
             }
         },
     )));
 }
 
-/// 连接/会话级明细按 info，packet 级杂项降到 debug（避免 UDP 包级事件刷爆日志）
+/// 渲染成 logfmt 一行。LuCI 日志页（joey 那套 parseLogfmt/parseLine）会：
+///   * 用 `level=` 决定行颜色与级别过滤（E/W/I/D）
+///   * 用 `time=` / `msg=` 判断这是 logfmt 行，并把字段解析出来展示
+///   * 单独取出 `outbound=` 和 `dialer=` 作为两列显示
+/// 所以这几个键必须存在、且值不要带空格（带空格用双引号包起来）。
+fn render_core_event_logfmt(event: &serde_json::Value, name: &str, level: &str) -> String {
+    let as_str = |key: &str| {
+        event
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let quoted = |value: String| -> String {
+        if value.is_empty() {
+            return String::new();
+        }
+        if value.contains(' ') || value.contains('"') {
+            format!("\"{}\"", value.replace('"', "'"))
+        } else {
+            value
+        }
+    };
+    let time = event
+        .get("timestampUnix")
+        .and_then(serde_json::Value::as_i64)
+        .map(format_unix_local)
+        .unwrap_or_else(|| "-".to_owned());
+
+    // 注意时间格式：LuCI 日志页用 /\b(\d{2}:\d{2}:\d{2})\b/ 抓时间列，
+    // ISO 的 "…T00:41:12" 里 T 与 0 之间没有词边界会抓不到，所以用空格分隔并加引号
+    // （正好和原版 dae / logrus 的 logfmt 风格一致）。
+    let mut line = format!(
+        "time=\"{time}\" level={level} event={name} msg=\"{}\"",
+        core_event_message(event, name).replace('"', "'")
+    );
+    // 页面会把这两个单独拿出来当列显示
+    for key in ["outbound", "dialer"] {
+        let value = quoted(as_str(key));
+        if !value.is_empty() {
+            line.push_str(&format!(" {key}={value}"));
+        }
+    }
+    // 其余有用的字段（domain / 进程 / 分组 / 目标 / 错误……）
+    for key in [
+        "sniffed",
+        "dial_target",
+        "group",
+        "policy",
+        "pname",
+        "peer",
+        "original_dst",
+        "network",
+        "candidate_count",
+        "error",
+        "sniff_error",
+    ] {
+        let value = quoted(as_str(key));
+        if !value.is_empty() && value != "null" {
+            line.push_str(&format!(" {key}={value}"));
+        }
+    }
+    line
+}
+
+/// 事件 -> 人能读的一句话
+fn core_event_message(event: &serde_json::Value, name: &str) -> String {
+    let as_str = |key: &str| {
+        event
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let target = {
+        let sniffed = as_str("sniffed");
+        if !sniffed.is_empty() {
+            sniffed.to_owned()
+        } else {
+            let dial_target = as_str("dial_target");
+            if !dial_target.is_empty() {
+                dial_target.to_owned()
+            } else {
+                as_str("original_dst").to_owned()
+            }
+        }
+    };
+    let outbound = as_str("outbound");
+    let dialer = as_str("dialer");
+    let via = |dialer: &str| {
+        if dialer.is_empty() {
+            String::new()
+        } else {
+            format!(" via {dialer}")
+        }
+    };
+    match name {
+        "tcp_route_chosen" => format!(
+            "{} {} -> {}{}",
+            as_str("network"),
+            target,
+            if outbound.is_empty() { "?" } else { outbound },
+            via(dialer)
+        ),
+        "udp_route_chosen" => format!(
+            "udp {} -> {}{}",
+            target,
+            if outbound.is_empty() { "?" } else { outbound },
+            via(dialer)
+        ),
+        "dns_path_chosen" | "dns_bind_query_finished" => {
+            format!("dns {} -> upstream={}{}", as_str("qname"), as_str("upstream"), via(dialer))
+        }
+        "udp_session_started" => format!("udp session started {}{}", target, via(dialer)),
+        "udp_session_stopped" => format!("udp session stopped {}", target),
+        "resident_health_checker_started" => format!(
+            "health checker started group={} policy={} candidates={}",
+            as_str("group"),
+            as_str("group_policy"),
+            event
+                .get("candidate_count")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_owned())
+        ),
+        "tcp_worker_started" => format!("tcp worker started (dial_mode={})", as_str("dial_mode")),
+        "udp_session_manager_started" => "udp session manager started".to_owned(),
+        "resident_health_scheduler_started" => "health scheduler started".to_owned(),
+        other if other.ends_with("_failed") => {
+            format!("{other}: {}", as_str("error"))
+        }
+        other => other.to_owned(),
+    }
+}
+
+/// unix 秒 -> 本地时间（YYYY-MM-DDTHH:MM:SS），给日志行的 time= 用
+fn format_unix_local(unix: i64) -> String {
+    let stamp = unix as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&stamp, &mut tm);
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+/// 级别优先取事件自带的 `residentLogLevel`（运行时自己的分类，17 种事件都有），
+/// 取不到才退回下面的启发式。
+fn resident_core_event_level_of(event: &serde_json::Value) -> &'static str {
+    let declared = event
+        .get("residentLogLevel")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match declared.to_ascii_lowercase().as_str() {
+        "error" => "error",
+        "warn" | "warning" => "warn",
+        "info" => "info",
+        "debug" => "debug",
+        "trace" => "trace",
+        _ => resident_core_event_level(
+            event
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        ),
+    }
+}
+
+/// 连接/会话级明细按 info，packet 级杂项降到 debug（启发式，仅当事件没带级别时使用）
 fn resident_core_event_level(name: &str) -> &'static str {
     if name.contains("route_chosen")
         || name.contains("path_chosen")
