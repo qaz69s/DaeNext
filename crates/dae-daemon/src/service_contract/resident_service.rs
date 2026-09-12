@@ -93,6 +93,13 @@ pub fn run_resident_service(options: &ResidentRunOptions) -> Result<(), String> 
     block_service_signals()?;
     let runtime_config = load_config_file(&options.config)
         .map_err(|err| format!("resident run config validation failed: {err}"))?;
+    // Dove 补丁：core 形态没有产品层（daed_product/logs 那段被 product-api 门控），
+    // resident 数据面事件默认只 dispatch、没人接就丢。这里给 core 绑一个 sink，
+    // 把事件按 JSONL 追加到 --logfile（轮转由包里的 init 负责）。
+    // 事件类型见 dae-resident-core/src/events/model.rs：
+    //   tcp_route_chosen / udp_route_chosen / dns_path_chosen /
+    //   udp_session_started / udp_session_stopped / *_failed ...
+    install_core_event_log_sink(options, &runtime_config);
     if !runtime_config.global.disable_waiting_network {
         wait_for_network_before_subscriptions()
             .map_err(|err| format!("waiting for network before subscriptions failed: {err}"))?;
@@ -753,4 +760,80 @@ mod tests {
         assert!(!err.contains("failed to read"), "err: {err}");
         let _ = fs::remove_dir_all(&root);
     }
+}
+
+// ── Dove 补丁：core-only 的事件日志 sink ────────────────────────────────────────
+// 背景：crates/dae-resident-core/src/events.rs 是 dispatch-only
+// （注释原文："File-based persistence was removed: resident events are
+// dispatch-only to the configured sink"），产品层由
+// daed_product/logs/init.rs 的 register_resident_event_product_log_sink 绑定。
+// core 关掉了 product-api，所以没有任何 sink —— 代理明细日志全部丢失。
+// 这里补上：连接/会话级事件按 info、packet 级按 debug 落 JSONL 到 --logfile。
+fn install_core_event_log_sink(options: &ResidentRunOptions, config: &Config) {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    let Some(path) = options.logfile.clone() else {
+        // 没给 --logfile 时不装（stdout/stderr 由 procd 收进 logd）
+        return;
+    };
+    let configured_level = config.global.log_level.clone();
+
+    let level_for_policy = configured_level.clone();
+    dae_resident_dataplane::facade::set_event_log_policies(
+        Some(Arc::new(move |event: &serde_json::Value| {
+            let name = event
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let level = resident_core_event_level(name);
+            dae_resident_dataplane::facade::ResidentEventLogDecision {
+                persist: resident_core_log_level_enabled(&level_for_policy, level),
+                level: Some(level.to_owned()),
+                max_entries: 10_000,
+                max_bytes: 50 * 1024 * 1024,
+            }
+        })),
+        None,
+    );
+
+    let sink_state: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
+    dae_resident_dataplane::facade::set_event_log_sink(Some(Arc::new(
+        move |event: &serde_json::Value| {
+            let Ok(mut guard) = sink_state.lock() else {
+                return;
+            };
+            if guard.is_none() {
+                *guard = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .ok();
+            }
+            if let Some(file) = guard.as_mut() {
+                let _ = writeln!(file, "{event}");
+            }
+        },
+    )));
+}
+
+/// 连接/会话级明细按 info，packet 级杂项降到 debug（避免 UDP 包级事件刷爆日志）
+fn resident_core_event_level(name: &str) -> &'static str {
+    if name.contains("route_chosen")
+        || name.contains("path_chosen")
+        || name.contains("session_started")
+        || name.contains("session_stopped")
+        || name.ends_with("_failed")
+    {
+        "info"
+    } else {
+        "debug"
+    }
+}
+
+/// 跟 global.log_level（String，默认 "info"）比较：低于等于配置级别才落盘
+fn resident_core_log_level_enabled(configured: &str, event_level: &str) -> bool {
+    const ORDER: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+    let rank = |level: &str| ORDER.iter().position(|candidate| *candidate == level).unwrap_or(2);
+    rank(event_level) <= rank(configured)
 }
