@@ -39,6 +39,7 @@ export interface APIClientInterface {
 const leadingSlashesRE = /^\/+/
 const trailingSlashesRE = /\/+$/
 const trailingSlashRE = /\/$/
+const documentSegmentRE = /\.html?$/i
 const staticFileServerMethodHint = 'method should be GET or HEAD'
 const apiSegment = 'api'
 const apiResourceSegments = new Set([
@@ -87,7 +88,30 @@ export function buildAPIURL(endpointURL: string, path: string, query?: Record<st
   return url
 }
 
-function canonicalizeEndpointPathname(pathname: string) {
+/**
+ * 把「接口地址」里的路径归一化成 API 根路径。
+ *
+ * URL 里可能出现三类路径：真正的挂载前缀（WebUI 被反向代理挂在 /daed/ 下）、
+ * API 资源段（/api/configs/1 这种贴多了的）、以及用户在输入框里多写的页面路径
+ * （/settings、/index.html）。只有第一类才应该保留前缀。
+ *
+ * ⚠️ 这里曾经对所有「未知首段」一律拼成 `<前缀>/api`：用户把接口地址填成
+ * `http://host:2023/settings` 时会被持久化成 `http://host:2023/settings/api`，
+ * 之后所有请求都打到 WebUI 静态处理器（GET 被回落成 index.html，POST 被回
+ * `{"error":"method should be GET or HEAD"}`），整个面板报废且无法自愈。
+ * 现在用「当前文档路径」校验前缀是否真实存在，不匹配就回到 origin 根下的 /api
+ * —— 顺带能治好浏览器里已经存坏的值。
+ */
+function currentAppPathname(): string {
+  const loc =
+    (typeof window !== 'undefined' && window.location) ||
+    (typeof globalThis !== 'undefined' && (globalThis as { location?: Location }).location) ||
+    null
+
+  return loc?.pathname ?? '/'
+}
+
+export function canonicalizeEndpointPathname(pathname: string, appPathname: string = currentAppPathname()) {
   const trimmedPath = pathname.replace(trailingSlashesRE, '')
 
   if (trimmedPath === '' || trimmedPath === '/') {
@@ -96,25 +120,42 @@ function canonicalizeEndpointPathname(pathname: string) {
 
   const segments = trimmedPath.split('/').filter(Boolean)
   const normalizedSegments = segments.map((segment) => segment.toLowerCase())
+  const appSegments = (appPathname ?? '/')
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => segment.toLowerCase())
   const apiIndex = normalizedSegments.indexOf(apiSegment)
   const resourceIndex = normalizedSegments.findIndex(
     (segment) => apiResourceSegments.has(segment) || frontendRouteSegments.has(segment),
   )
 
+  const keepPrefix = (prefixSegments: string[]) => {
+    // 目录挂载点不会以 .html/.htm 结尾：面板本来就served在 /index.html 时，
+    // 用户照着地址栏抄 `http://host:2023/index.html` 不该被当成挂载前缀。
+    if (prefixSegments.some((segment) => documentSegmentRE.test(segment))) {
+      return false
+    }
+    return prefixSegments.length === 0 || prefixSegments.every((segment, index) => appSegments[index] === segment)
+  }
+
   if (resourceIndex >= 0 && (apiIndex === -1 || resourceIndex < apiIndex)) {
-    return `/${[...segments.slice(0, resourceIndex), apiSegment].join('/')}`
+    return keepPrefix(normalizedSegments.slice(0, resourceIndex))
+      ? `/${[...segments.slice(0, resourceIndex), apiSegment].join('/')}`
+      : `/${apiSegment}`
   }
 
   if (apiIndex >= 0) {
-    return `/${[...segments.slice(0, apiIndex), apiSegment].join('/')}`
+    return keepPrefix(normalizedSegments.slice(0, apiIndex))
+      ? `/${[...segments.slice(0, apiIndex), apiSegment].join('/')}`
+      : `/${apiSegment}`
   }
 
-  return `/${[...segments, apiSegment].join('/')}`
+  return keepPrefix(normalizedSegments) ? `/${[...segments, apiSegment].join('/')}` : `/${apiSegment}`
 }
 
-export function normalizeEndpointURL(raw: string): string {
+export function normalizeEndpointURL(raw: string, appPathname: string = currentAppPathname()): string {
   const url = new URL(raw)
-  url.pathname = canonicalizeEndpointPathname(url.pathname)
+  url.pathname = canonicalizeEndpointPathname(url.pathname, appPathname)
   url.search = ''
   url.hash = ''
   return url.toString().replace(trailingSlashRE, '')
@@ -134,15 +175,19 @@ function parseResponsePayload(text: string, contentType: string | null): unknown
   }
 }
 
-function responseErrorMessage(response: Response, payload: unknown): string {
-  if (typeof payload === 'object' && payload && 'error' in payload && typeof payload.error === 'string') {
-    return payload.error
-  }
-  if (typeof payload === 'string' && payload.includes(staticFileServerMethodHint)) {
+function staticHandlerErrorMessage(message: string): string {
+  if (message.includes(staticFileServerMethodHint)) {
     return 'API request reached the WebUI static handler; check the endpoint URL and make sure it points to /api'
   }
+  return message
+}
+
+function responseErrorMessage(response: Response, payload: unknown): string {
+  if (typeof payload === 'object' && payload && 'error' in payload && typeof payload.error === 'string') {
+    return staticHandlerErrorMessage(payload.error)
+  }
   if (typeof payload === 'string' && payload.trim()) {
-    return payload.trim()
+    return staticHandlerErrorMessage(payload.trim())
   }
   return `${response.status} ${response.statusText}`
 }
