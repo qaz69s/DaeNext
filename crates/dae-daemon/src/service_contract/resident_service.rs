@@ -861,15 +861,10 @@ fn render_core_event_logfmt(event: &serde_json::Value, name: &str, level: &str) 
             value
         }
     };
-    let time = event
-        .get("timestampUnix")
-        .and_then(serde_json::Value::as_i64)
-        .map(format_unix_local)
-        .unwrap_or_else(|| "-".to_owned());
-
-    // 注意时间格式：LuCI 日志页用 /\b(\d{2}:\d{2}:\d{2})\b/ 抓时间列，
-    // ISO 的 "…T00:41:12" 里 T 与 0 之间没有词边界会抓不到，所以用空格分隔并加引号
-    // （正好和原版 dae / logrus 的 logfmt 风格一致）。
+    // 时间戳样式对齐 honk：本地时间 + UTC 偏移 + 微秒（见 format_now_local_iso）。
+    // LuCI 日志页（joey 那套）抓时间列的 extractHms 已同步放宽成不带词边界，
+    // 所以 ISO 的 "…T00:41:12.123456+08:00" 也能取到 HH:MM:SS。
+    let time = format_now_local_iso();
     let mut line = format!(
         "time=\"{time}\" level={level} event={name} msg=\"{}\"",
         core_event_message(event, name).replace('"', "'")
@@ -971,37 +966,110 @@ fn core_event_message(event: &serde_json::Value, name: &str) -> String {
     }
 }
 
-/// unix 秒 -> 本地时间（YYYY-MM-DDTHH:MM:SS），给日志行的 time= 用
-fn format_unix_local(unix: i64) -> String {
-    let stamp = unix as libc::time_t;
+/// unix 秒 -> honk 风格时间戳：本机本地时间 + UTC 偏移 + 微秒。
+///
+/// 对齐 daeuniverse/honk（`crates/honk-core/src/lib.rs` 的 `LocalTime`，
+/// `%Y-%m-%dT%H:%M:%S%.6f%:z`）：honk 的理由是默认 timer 打 UTC，
+/// 跟路由器 syslog / 运维的钟对不上。这里用写入时刻的 CLOCK_REALTIME——
+/// 事件本身只带 `timestampUnix`（秒级，无亚秒），写入发生在事件产生后微秒级，
+/// 用写时刻的时间戳既与 honk 同形，也不会出现"秒取自事件、微秒取自另一时刻"的错配。
+fn format_now_local_iso() -> String {
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_REALTIME, &mut now);
+    }
+    let stamp = now.tv_sec as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         libc::localtime_r(&stamp, &mut tm);
     }
+    // tm_gmtoff = 本地时间相对 UTC 的偏移（秒），由 localtime_r 填好
+    let offset = tm.tm_gmtoff;
+    let (sign, abs) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}{}{:02}:{:02}",
         tm.tm_year + 1900,
         tm.tm_mon + 1,
         tm.tm_mday,
         tm.tm_hour,
         tm.tm_min,
-        tm.tm_sec
+        tm.tm_sec,
+        now.tv_nsec / 1_000,
+        sign,
+        abs / 3600,
+        (abs % 3600) / 60
     )
 }
 
-/// 级别优先取事件自带的 `residentLogLevel`（运行时自己的分类，17 种事件都有），
-/// 取不到才退回下面的启发式。
+/// 事件级别。优先用事件自带的 `severity` / `lifecycleClass`（运行时自己对每种事件
+/// 的分类，见 dae-resident-core/src/events/model.rs），按 honk 的策略渲染
+/// （daeuniverse/honk #231 + doc/reference/global.md）：
+///   * info  = 运行状态：启动、重载、健康检查
+///   * debug = 每条连接的分流记录（route_chosen / session / packet / offload）
+///   * warn  = warning（dropped / skipped / timeout）
+///   * error = error / fatal
+/// 好处和 honk 一样：默认 info 不会被流量刷屏，要核对分流就切 debug。
 fn resident_core_event_level_of(event: &serde_json::Value) -> &'static str {
-    let declared = event
+    if let Some(declared) = event
         .get("residentLogLevel")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    match declared.to_ascii_lowercase().as_str() {
-        "error" => "error",
-        "warn" | "warning" => "warn",
-        "info" => "info",
-        "debug" => "debug",
-        "trace" => "trace",
+    {
+        match declared.to_ascii_lowercase().as_str() {
+            "fatal" | "error" => return "error",
+            "warn" | "warning" => return "warn",
+            "info" => return "info",
+            "debug" => return "debug",
+            "trace" => return "trace",
+            _ => {}
+        }
+    }
+
+    let severity = event
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match severity.as_str() {
+        "fatal" | "error" => return "error",
+        "warning" | "warn" => return "warn",
+        "trace" => return "trace",
+        _ => {}
+    }
+
+    // 运行状态类（worker / scheduler / session manager 的启停、健康检查）归 info。
+    // 必须按名字兜一层：运行时给 `tcp_worker_stopped` 打的 lifecycleClass 是 flow
+    // （名字里没有 "started"，不命中 Startup 分支），会掉进下面的 flow -> debug，
+    // 于是出现"worker started 是 info、worker stopped 是 debug"的割裂。
+    // 注意只匹配 worker/scheduler/manager 这些**运行时组件**，
+    // 不能用 "started|stopped" 泛匹配——那会误伤每条会话的 udp_session_started。
+    let name_lower = event
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name_lower.contains("worker")
+        || name_lower.contains("scheduler")
+        || name_lower.contains("manager")
+        || name_lower.contains("health")
+        || name_lower.contains("check")
+        || name_lower.contains("reload")
+        || name_lower.contains("startup")
+        || name_lower.contains("dataplane_enabled")
+    {
+        return "info";
+    }
+
+    match event
+        .get("lifecycleClass")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        // 运行状态
+        "startup" | "reload" | "health" => "info",
+        // 每条连接 / Packet / 内部调试
+        "packet" | "flow" | "debug" => "debug",
         _ => resident_core_event_level(
             event
                 .get("event")
@@ -1011,19 +1079,29 @@ fn resident_core_event_level_of(event: &serde_json::Value) -> &'static str {
     }
 }
 
-/// 连接/会话级明细按 info，packet 级杂项降到 debug（启发式，仅当事件没带级别时使用）
+/// 兜底：事件里没有 severity / lifecycleClass 时按名字判（同一套 honk 策略）
 fn resident_core_event_level(name: &str) -> &'static str {
-    if name.contains("route_chosen")
-        || name.contains("path_chosen")
-        || name.contains("session_started")
-        || name.contains("session_stopped")
-        || name.ends_with("_failed")
+    let low = name.to_ascii_lowercase();
+    if low.contains("failed") || low.contains("error") || low.contains("panic") {
+        "error"
+    } else if low.contains("dropped")
+        || low.contains("skipped")
+        || low.contains("timeout")
+        || low.contains("timed_out")
+    {
+        "warn"
+    } else if low.contains("startup")
+        || low.contains("started")
+        || low.contains("reload")
+        || low.contains("health")
+        || low.contains("check")
     {
         "info"
     } else {
         "debug"
     }
 }
+
 
 /// 跟 global.log_level（String，默认 "info"）比较：低于等于配置级别才落盘
 fn resident_core_log_level_enabled(configured: &str, event_level: &str) -> bool {
